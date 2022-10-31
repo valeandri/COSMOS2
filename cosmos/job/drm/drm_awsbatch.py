@@ -11,6 +11,7 @@ from concurrent.futures.thread import ThreadPoolExecutor
 import boto3
 import more_itertools
 from botocore.config import Config
+import botocore.exceptions
 
 from cosmos.api import TaskStatus
 from cosmos.job.drm.DRM_Base import DRM
@@ -227,7 +228,7 @@ def get_aws_batch_job_infos(all_job_ids, boto_config=None, missing_ok=False):
     return returned_jobs
 
 
-def register_base_job_definition(container_image, environment, command, mount_points, volumes, shm_size=None):
+def register_base_job_definition(container_image, environment, command, mount_points, volumes, job_name, shm_size=None):
 
     # add custom mount points and volumes, if empty leave default
     # eval converts mount_points and volumes strings back to list of dicts
@@ -257,11 +258,25 @@ def register_base_job_definition(container_image, environment, command, mount_po
         container_properties["linuxParameters"] = {"sharedMemorySize": shm_size}
 
     batch = boto3.client(service_name="batch", config=BOTO_CONFIG)
-    resp = batch.register_job_definition(
-        jobDefinitionName="cosmos_base_job_definition",
-        type="container",
-        containerProperties=container_properties,
-    )
+
+    # try register job definition using unique identifier
+    # if error exit code 1
+    if len(job_name) < 128:
+        resp = batch.register_job_definition(
+            jobDefinitionName="cosmos_base_jobdef_{job_name}".format(job_name=job_name),
+            type="container",
+            containerProperties=container_properties,
+        )
+    else:
+        try:
+            resp = batch.register_job_definition(
+                jobDefinitionName="cosmos_base_job_definition",
+                type="container",
+                containerProperties=container_properties,
+            )
+        except botocore.exceptions.ClientError as Err:
+            raise SystemExit(1)
+
     _check_aws_response_for_error(resp)
     job_definition_arn = resp["jobDefinitionArn"]
 
@@ -368,12 +383,13 @@ class DRM_AWSBatch(DRM):
         # Register job definitions for each container_image
         # NOTE: must convert mount_points and volumes to strings to preserve set()
 
-        for container_image, shm_size, mount_points, volumes in set([
+        for container_image, shm_size, mount_points, volumes, task_uid in set([
                 (
                     task.drm_options["container_image"],
                     task.drm_options["shm_size"] if "shm_size" in task.drm_options.keys() else None,
                     str(task.mount_points),
                     str(task.volumes),
+                    task.uid
                 )
                 for task in tasks
             ]):
@@ -387,6 +403,7 @@ class DRM_AWSBatch(DRM):
                     mount_points=mount_points,
                     volumes=volumes,
                     shm_size=shm_size,
+                    job_name=task_uid
                 )
 
         if len(tasks) > 1:
